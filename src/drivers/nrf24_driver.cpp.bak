@@ -1,0 +1,109 @@
+#include "nrf24_driver.h"
+#include "../config.h"
+
+NRF24Driver::NRF24Driver(uint8_t ce_pin, uint8_t csn_pin)
+    : _radio(ce_pin, csn_pin), _init(false) {}
+
+bool NRF24Driver::begin() {
+    DEBUG_UART.println(F("[NRF24] Initializing (TX mode)..."));
+
+    SPI.setMOSI(NRF24_SPI_MOSI);
+    SPI.setMISO(NRF24_SPI_MISO);
+    SPI.setSCLK(NRF24_SPI_SCK);
+    SPI.begin();
+
+    if (!_radio.begin(&SPI) || !_radio.isChipConnected()) {
+        DEBUG_UART.println(F("[NRF24] ERROR: chip not found!"));
+        return false;
+    }
+
+    _radio.setChannel(NRF24_CHANNEL);
+    _radio.setPALevel(NRF24_PA_LEVEL);
+    _radio.setDataRate(NRF24_DATA_RATE);
+    _radio.setCRCLength(RF24_CRC_16);
+    _radio.setAddressWidth(5);
+    _radio.setAutoAck(false);         // kein ACK-Mechanismus
+    _radio.setRetries(0, 0);          // keine Retries
+    
+    // === HIER DIE ANPASSUNG ===
+    _radio.enableDynamicPayloads();   // Dynamische Paketgröße aktivieren
+    // _radio.setPayloadSize(sizeof(SensorData)); // <- Diese Zeile kann weg!
+
+    _radio.openWritingPipe(CONTROLLER_ADDRESS);
+    _radio.openReadingPipe(1, SENSOR_ADDRESS);
+
+    _radio.flush_tx();
+    _radio.flush_rx();
+    _radio.stopListening();
+
+    DEBUG_UART.print(F("[NRF24] CH:"));
+    DEBUG_UART.print(NRF24_CHANNEL);
+    DEBUG_UART.println(F(" Ping-Pong ready"));
+
+    _init = true;
+    return true;
+}
+
+uint8_t NRF24Driver::checksumCtrl(const ControllerData& d) {
+    uint8_t cs = 0;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&d);
+    for (size_t i = 0; i < offsetof(ControllerData, checksum); i++) cs ^= p[i];
+    return cs;
+}
+
+bool NRF24Driver::sendAndReceive(const ControllerData& ctrl, SensorData* sensor) {
+    if (!_init) return false;
+
+    // --- Schritt 1: Senden ---
+    ControllerData tx = ctrl;
+    tx.checksum = checksumCtrl(tx);
+
+    _radio.stopListening();
+    bool ok = _radio.write(&tx, sizeof(ControllerData));
+
+    if (!ok) {
+        DEBUG_UART.println(F("[NRF24] TX failed"));
+        return false;
+    }
+
+    // --- Schritt 2: Auf Antwort warten ---
+    if (sensor) {
+        _radio.startListening();
+
+        uint32_t t = millis();
+        bool got_reply = false;
+        while (millis() - t < 20) {        // max 8ms warten
+            if (_radio.available()) {
+                got_reply = true;
+                break;
+            }
+        }
+
+        if (got_reply) {
+            _radio.read(sensor, sizeof(SensorData));
+        } else {
+            *sensor = SensorData{};
+            DEBUG_UART.println(F("[NRF24] no reply"));
+        }
+
+        _radio.stopListening();
+    }
+
+    return true;
+}
+
+bool NRF24Driver::sendMessage(const ControllerData& ctrl) {
+    return sendAndReceive(ctrl, nullptr);
+}
+
+void NRF24Driver::powerDown() {
+    if (_init) { _radio.powerDown(); DEBUG_UART.println(F("[NRF24] power down")); }
+}
+
+void NRF24Driver::powerUp() {
+    if (_init) { _radio.powerUp(); DEBUG_UART.println(F("[NRF24] power up")); }
+}
+
+void NRF24Driver::printDetails() {
+    if (_init) _radio.printDetails();
+}
