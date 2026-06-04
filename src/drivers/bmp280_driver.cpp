@@ -18,13 +18,14 @@ bool BMP280Driver::init() {
         
         // Configure sensor for weather monitoring (default settings)
         // Ultra-low power, minimal noise
-        _bmp.setSampling(
-            Adafruit_BMP280::MODE_NORMAL,      // Operating Mode
-            Adafruit_BMP280::SAMPLING_X1,      // Temperature oversampling
-            Adafruit_BMP280::SAMPLING_X1,      // Pressure oversampling
-            Adafruit_BMP280::FILTER_OFF,       // Filtering
-            Adafruit_BMP280::STANDBY_MS_1000   // Standby time
-        );
+    // Tipp für eine spätere Optimierung in deiner bmp280_driver.cpp:
+    _bmp.setSampling(
+        Adafruit_BMP280::MODE_NORMAL,     // Fortlaufende Messung
+        Adafruit_BMP280::SAMPLING_X2,     // Temperatur-Oversampling
+        Adafruit_BMP280::SAMPLING_X16,    // Hohes Druck-Oversampling für präzise Höhe
+        Adafruit_BMP280::FILTER_X16,      // Filter gegen Luftschübe/Rauschen
+        Adafruit_BMP280::STANDBY_MS_63    // Schnelle Aktualisierung (~15Hz)
+    );
         
         return true;
     }
@@ -60,7 +61,7 @@ void BMP280Driver::readData(float& pressure, float& temperature, float& altitude
     
     pressure = _bmp.readPressure();      // Pa
     temperature = _bmp.readTemperature(); // °C
-    altitude = _bmp.readAltitude(_sea_level_pressure * 100);  // Convert hPa to Pa
+    altitude = _bmp.readAltitude(_sea_level_pressure);  // Convert hPa to Pa
 }
 
 float BMP280Driver::getPressureHPa() {

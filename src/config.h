@@ -8,7 +8,13 @@
 #define DEBUG_UART          Serial
 #define SEA_LEVEL_PRESSURE  1013.25f
 
+// --- Status LEDs Controller (Neu) ---
+#define LED_GREEN_PIN       PB1   // Grüne Status-LED (z.B. Verbindung OK)
+#define LED_RED_PIN         PB10  // Rote Status-LED (z.B. Fehler / Akkuwarnung)
+
 // --- I2C Bus Pins (Sensors & OLED) ---
+// HINWEIS: An diesem Bus hängen parallel das OLED-Display (0x3C)
+// und das lokale Barometer BMP280 (0x76). Keine Adresskonflikte!
 #define I2C_SDA_PIN         PB7
 #define I2C_SCL_PIN         PB6
 
@@ -62,6 +68,9 @@ struct __attribute__((packed)) SensorData {
 //  CONTROLLER CONFIG
 // ===========================================================================
 
+// ===========================================================================
+//  CONTROLLER CONFIG
+// ===========================================================================
 #define LEFT_X_PIN          PA0
 #define LEFT_Y_PIN          PA1
 #define LEFT_SW_PIN         PA4
@@ -69,8 +78,30 @@ struct __attribute__((packed)) SensorData {
 #define RIGHT_Y_PIN         PA3
 #define RIGHT_SW_PIN        PB3
 
-#define BUZZER_PIN          PA15
+// --- Controller Akku-Messung ---
+// ===========================================================================
+//  CONTROLLER CONFIG
+// ===========================================================================
+#define LEFT_X_PIN          PA0
+#define LEFT_Y_PIN          PA1
+#define LEFT_SW_PIN         PA4
+#define RIGHT_X_PIN         PA2
+#define RIGHT_Y_PIN         PA3
+#define RIGHT_SW_PIN        PB3
 
+// --- Angepasst für 3x 1.5V Batterien am Controller ---
+#define CTRL_BAT_ADC_PIN     PB0
+#define CTRL_BAT_DIVIDER_FACTOR 1.5f  
+#define CTRL_BAT_VREF_MV     3300
+#define CTRL_BAT_MIN_MV      3000     // 3x 1.0V (Batterien fast leer)
+#define CTRL_BAT_MAX_MV      4500     // 3x 1.5V (Frische Batterien)
+
+// --- Grenzen für die Drohne (1S LiPo) ---
+#define DRONE_BAT_MIN_MV     3200
+#define DRONE_BAT_MAX_MV     4200
+// ---------------------------------------
+
+#define BUZZER_PIN          PA15
 #define ADC_CENTER_VALUE    2047
 #define ADC_DEADBAND        50
 #define ADC_MIN_VALUE       0
