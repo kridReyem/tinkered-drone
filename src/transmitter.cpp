@@ -7,17 +7,16 @@
 #include "drivers/piezo_buzzer.h"
 #include "bmp280_driver.h"
 
-// Lokales Barometer für den Controller erstellen
-BMP280Driver localBmp(0x76);
+// --- Globale Zustandsvariablen ---
+bool drohne_scharf    = false;
+bool funk_verbunden   = false;
 
-
-static float home_altitude = 0.0f;
-static bool home_set = false;
-float relative_altitude = 0.0f; // Enthält die berechnete Höhe für das OLED
-char height_mode_symbol = '?';  // 'R' für Relativ (Verbunden), 'L' für Lokal (Fallback)
-
-
-
+// --- Lokales Barometer ---
+BMP280Driver localBmp(MY_BMP280_ADDRESS);
+static float home_altitude   = 0.0f;
+static bool  home_set        = false;
+float        relative_altitude = 0.0f;
+char         height_mode_symbol = '?';
 
 // =======================================================================
 // INITIALISIERUNGS-ANIMATION (AIRCRAFT)
@@ -58,29 +57,34 @@ const uint8_t PROGMEM aircraft_frames[ANIM_FRAME_COUNT][288] = {
   {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,31,254,0,0,0,127,255,254,0,0,0,255,240,6,0,0,0,192,0,6,0,0,0,240,0,28,0,254,0,127,255,248,0,255,0,7,255,248,0,195,128,6,0,16,0,97,128,6,0,56,2,96,192,6,0,63,135,96,192,126,0,115,247,48,127,255,1,224,127,48,127,3,255,128,14,48,0,1,254,0,7,16,0,0,0,0,3,24,0,0,0,0,3,28,0,0,0,0,7,15,0,0,0,0,15,3,192,0,0,0,31,0,248,0,0,0,127,0,63,192,0,3,231,0,7,255,255,255,130,0,0,63,255,252,0,0,0,0,3,128,0,0,0,0,1,192,0,0,0,0,0,248,0,0,0,0,0,220,0,0,0,0,0,204,0,0,0,0,0,204,0,0,0,0,0,252,0,0,0,0,0,120,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
 };
 
-PiezoBuzzer buzzer(BUZZER_PIN);
+// --- Hardware-Objekte ---
+PiezoBuzzer    buzzer(BUZZER_PIN);
+SSD1306Driver  oled(&Wire);
+RF24           radio(NRF24_CE, NRF24_CSN);
 
-SSD1306Driver oled(&Wire);
-RF24 radio(NRF24_CE, NRF24_CSN);
-
-// --- Globale Variablen für Timer, Signal und Telemetrie ---
-uint32_t flight_start_ms = 0;
-uint32_t flight_duration_s = 0;
-bool timer_active = false;
+// --- Globale Timer & Telemetrie ---
+uint32_t flight_start_ms      = 0;
+uint32_t total_flight_time_ms = 0;
+bool     flight_timer_active  = false;
 uint32_t last_valid_packet_ms = 0;
 
-// Signalstärken-Berechnung (Rolling History der letzten 100 Versuche)
-bool signal_history[100] = {false};
-uint8_t signal_idx = 0;
-uint8_t signal_percent = 0;
+bool     signal_history[100]  = {false};
+uint8_t  signal_idx           = 0;
+uint8_t  signal_percent       = 0;
 
-// Telemetriewerte
-static float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0, alt = 0;
-static uint16_t drone_bat_mv = 3700; // Pseudo-Startwert 3.7V
-static bool funk_verbunden = false;
-static uint16_t ctrl_bat_mv = 3800;  // Pseudo-Startwert 3.8V
+static float    ax = 0, ay = 0, az = 0;
+static float    gx = 0, gy = 0, gz = 0;
+static float    alt = 0;
+static uint16_t drone_bat_mv = 3700;
+static uint16_t ctrl_bat_mv  = 3800;
 
+uint8_t       current_page = 0;
+const uint8_t MAX_PAGES    = 4;
 
+// --- Init-Status ---
+bool nrf_ok       = false;
+bool bmp_local_ok = false;
+bool oled_ok      = false;
 
 // ---------------------------------------------------------------------------
 // Hilfsfunktionen
@@ -92,50 +96,35 @@ uint8_t calcControllerChecksum(const ControllerData& c) {
     return cs;
 }
 
-// Hilfsfunktion: Rendert ein horizontales Bitmap direkt im SSD1306-Speicherlayout
 void playBootAnimation() {
-    // 1 Runde der Animation (alle 28 Frames abspielen)
     for (int frame = 0; frame < ANIM_FRAME_COUNT; frame++) {
-        
-        // Das SSD1306 nutzt 8 horizontale Pages (Zeilen) à 128 Pixel Breite
         for (uint8_t page = 0; page < 8; page++) {
-            
-            // Setze den Cursor im Display-Controller manuell (Page & Spalten-Adresse)
-            Wire.beginTransmission(0x3C); // Deine I2C Adresse (meist 0x3C, bei Wokwi oft 0x3D)
-            Wire.write(0x00);             // Control Byte: Folgender Byte-Strom enthält Befehle
-            Wire.write(0xB0 + page);      // Setze Page Start-Adresse
-            Wire.write(0x00);             // Setze Spalten-Adresse Low-Nibble (Pixel 0)
-            Wire.write(0x10);             // Setze Spalten-Adresse High-Nibble
+            Wire.beginTransmission(OLED_I2C_ADDR);
+            Wire.write(0x00);
+            Wire.write(0xB0 + page);
+            Wire.write(0x00);
+            Wire.write(0x10);
             Wire.endTransmission();
 
-            // Sende die Daten für die aktuelle Zeile (128 Pixel Spaltenbreite)
-            Wire.beginTransmission(0x3C);
-            Wire.write(0x40);             // Control Byte: Folgender Byte-Strom enthält reine RAM-Daten
-            
+            Wire.beginTransmission(OLED_I2C_ADDR);
+            Wire.write(0x40);
             for (uint8_t col = 0; col < 128; col++) {
                 uint8_t displayData = 0;
-                
-                // Wir wollen die Animation mittig anzeigen (X ab Pixel 40, Y ab Pixel 8)
-                // Frame ist 48x48 Pixel groß (6 Pages hoch, 48 Pixel breit)
                 if (col >= 40 && col < 88 && page >= 1 && page < 7) {
-                    uint8_t anim_x = col - 40;
+                    uint8_t anim_x      = col - 40;
                     uint8_t anim_y_page = page - 1;
-                    
-                    // Umrechnung des Wokwi-Bitmap Formats (horizontal) in das SSD1306 Page-Format (vertikal)
                     for (uint8_t bit = 0; bit < 8; bit++) {
-                        uint16_t pixel_y = (anim_y_page * 8) + bit;
+                        uint16_t pixel_y  = (anim_y_page * 8) + bit;
                         uint16_t byte_idx = (pixel_y * (ANIM_FRAME_WIDTH / 8)) + (anim_x / 8);
-                        uint8_t byte_val = pgm_read_byte(&(aircraft_frames[frame][byte_idx]));                        
-                        if (byte_val & (0x80 >> (anim_x % 8))) {
-                            displayData |= (1 << bit);
-                        }
+                        uint8_t  byte_val = pgm_read_byte(&(aircraft_frames[frame][byte_idx]));
+                        if (byte_val & (0x80 >> (anim_x % 8))) displayData |= (1 << bit);
                     }
                 }
                 Wire.write(displayData);
             }
             Wire.endTransmission();
         }
-        delay(ANIM_FRAME_DELAY); // Kurze Pause bis zum nächsten Bild
+        delay(ANIM_FRAME_DELAY);
     }
 }
 
@@ -158,470 +147,429 @@ bool init_funk_tx() {
     return true;
 }
 
-// Aktualisiert die Signalstärke basierend auf den letzten 100 Übertragungen
 void updateSignalStrength(bool success) {
     signal_history[signal_idx] = success;
     signal_idx = (signal_idx + 1) % 100;
-    
-    uint8_t success_count = 0;
-    for (uint8_t i = 0; i < 100; i++) {
-        if (signal_history[i]) success_count++;
-    }
-    signal_percent = success_count; // Da 100 Elemente, entspricht Counter direkt den %
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < 100; i++) if (signal_history[i]) count++;
+    signal_percent = count;
 }
 
 void readControllerBattery() {
-    uint32_t raw = analogRead(CTRL_BAT_ADC_PIN);
-    uint32_t measured_mv = (raw * CTRL_BAT_VREF_MV * CTRL_BAT_DIVIDER_FACTOR) / 4095;
-    
-    // Fallback: Wenn der Pin gegen 0 geht (kein Akku dran / USB-Betrieb), nutzen wir Pseudo-Wert 3.9V
-    if (measured_mv < 500) {
-        ctrl_bat_mv = 3900; 
-    } else {
-        ctrl_bat_mv = measured_mv;
+    uint32_t adc_sum = 0;
+    for (int i = 0; i < 4; i++) {
+        adc_sum += analogRead(CTRL_BAT_ADC_PIN);
+        delayMicroseconds(10);
     }
+    uint32_t avg_adc = adc_sum / 4;
+    ctrl_bat_mv = (uint16_t)((avg_adc * CTRL_BAT_VREF_MV * CTRL_BAT_DIVIDER_FACTOR) / 4095);
 }
 
-// Hilfsfunktion zum Zeichnen eines Batterie-Balkens incl. Text
 void drawBatteryBar(uint8_t y, const char* label, uint16_t current_mv, uint16_t min_mv, uint16_t max_mv) {
     oled.printAt(0, y, label);
-    
-    // Prozent berechnen und begrenzen
     long percent = 0;
-    if (current_mv > min_mv) {
+    if (current_mv > min_mv)
         percent = ((long)(current_mv - min_mv) * 100) / (max_mv - min_mv);
-    }
     if (percent > 100) percent = 100;
-    
-    // Balken-Rahmen zeichnen (Breite: 35 Pixel, Höhe: 7 Pixel)
     uint8_t bar_x = 36;
     oled.drawRect(bar_x, y, 35, 7);
-    
-    // Balken füllen proportional zu den Prozenten (max 31 Pixel im Inneren)
     uint8_t fill_width = (percent * 31) / 100;
-    if (fill_width > 0) {
-        oled.fillRect(bar_x + 2, y + 2, fill_width, 3);
-    }
-    
-    // Spannung in Klammern dahinter (z.B. " (3.7V)")
+    if (fill_width > 0) oled.fillRect(bar_x + 2, y + 2, fill_width, 3);
     oled.printAt(74, y, "(");
     long v_whole = current_mv / 1000;
-    long v_dec = (current_mv % 1000) / 100;
+    long v_dec   = (current_mv % 1000) / 100;
     oled.printAt(80, y, v_whole);
     oled.printAt(86, y, ".");
     oled.printAt(92, y, v_dec);
     oled.printAt(98, y, "V)");
 }
 
-void updateOLEDDisplay() {
-
+void updateOLEDDisplay(const ControllerData& packet) {
     oled.clearBuffer();
+    char buf[32];
 
-    // =======================================================================
-    // ZEILE 1: Kombizeile (Signal links, Höhe Mitte, Zeit rechts)
-    // =======================================================================
-    
-    // 1. Signalstärke (Pixel 0 bis 42)
-    oled.printAt(0, 0, "SIG:");
-    oled.printAt(24, 0, (long)signal_percent);
-    oled.printAt(42, 0, "%");
+    // --- Flugtimer berechnen (ein einziges System) ---
+    uint32_t current_flight_ms = total_flight_time_ms;
+    if (flight_timer_active) current_flight_ms += (millis() - flight_start_ms);
+    uint32_t total_seconds = current_flight_ms / 1000;
+    uint16_t minutes = total_seconds / 60;
+    uint16_t seconds = total_seconds % 60;
+    char timeBuf[10];
+    snprintf(timeBuf, sizeof(timeBuf), "%02u:%02u", minutes, seconds);
 
-    // 2. NEU: Relative Höhe & Modus in der Mitte (Pixel 52 bis 92)
-    // Wir nutzen hier 'relative_altitude' statt 'alt'
-    long alt_whole = (long)relative_altitude;
-    long alt_dec   = (long)abs((relative_altitude - alt_whole) * 10); 
-    
-    // Falls die Zahl negativ wird (z.B. Drohne landet tiefer als der Pilot steht), 
-    // sorgt abs() bei den Nachkommastellen dafür, dass kein doppeltes Minus entsteht.
-    if (relative_altitude < 0 && alt_whole == 0) {
-        oled.printAt(52, 0, "-0"); // Sonderfall für -0.X Meter
-    } else {
-        oled.printAt(52, 0, alt_whole);
+    switch (current_page) {
+
+        case 0: {
+            oled.printAt(0, 0, "1 FLUG-MODUS");
+            oled.printAt(94, 0, timeBuf);
+            float alt_abs = (relative_altitude < 0.0f) ? 0.0f : relative_altitude;
+            uint16_t alt_m  = (uint16_t)alt_abs;
+            uint16_t alt_cm = (uint16_t)((alt_abs - (float)alt_m) * 100.0f + 0.5f);
+            if (alt_cm >= 100) { alt_m++; alt_cm = 0; }
+            snprintf(buf, sizeof(buf), "Hoehe: %u.%02um", alt_m, alt_cm);
+            oled.printAt(0, 16, buf);
+            snprintf(buf, sizeof(buf), "Signal: %d%%", signal_percent);
+            oled.printAt(0, 32, buf);
+            oled.printAt(0, 48, drohne_scharf ? "STATUS: >>>SCHARF<<<" : "STATUS: ENTSCHAERFT");
+            break;
+        }
+
+        case 1: {
+            oled.printAt(0, 0, "2 AKKU & STICKS");
+            oled.printAt(94, 0, timeBuf);
+            uint16_t c_volt  = ctrl_bat_mv / 1000;
+            uint16_t c_mvolt = (ctrl_bat_mv % 1000) / 10;
+            uint16_t d_volt  = drone_bat_mv / 1000;
+            uint16_t d_mvolt = (drone_bat_mv % 1000) / 10;
+            snprintf(buf, sizeof(buf), "C: %u.%02uV   D: %u.%02uV", c_volt, c_mvolt, d_volt, d_mvolt);
+            oled.printAt(0, 14, buf);
+            uint8_t cy  = 46;
+            uint8_t clx = 24;
+            uint8_t crx = 88;
+            oled.drawHLine(clx - 16, cy, 33); oled.drawVLine(clx, cy - 16, 33);
+            oled.drawHLine(crx - 16, cy, 33); oled.drawVLine(crx, cy - 16, 33);
+            int16_t move_l_x = ((int32_t)packet.left_x  - 2048) * 14 / 2048;
+            int16_t move_l_y = ((int32_t)packet.left_y  - 2048) * 14 / 2048;
+            int16_t move_r_x = ((int32_t)packet.right_x - 2048) * 14 / 2048;
+            int16_t move_r_y = ((int32_t)packet.right_y - 2048) * 14 / 2048;
+            oled.fillRect(clx + move_l_x - 1, cy - move_l_y - 1, 3, 3, true);
+            oled.fillRect(crx + move_r_x - 1, cy - move_r_y - 1, 3, 3, true);
+            oled.printAt(0, 40, "L");
+            oled.printAt(112, 40, "R");
+            break;
+        }
+
+        case 2: {
+            oled.printAt(0, 0, "3 FUNK & GYRO");
+            oled.printAt(94, 0, timeBuf);
+            auto format_gyro = [](char* out, const char* axis, float val) {
+                char sign = (val < 0) ? '-' : ' ';
+                if (val < 0) val = -val;
+                uint16_t ganze     = (uint16_t)val;
+                uint16_t nachkomma = (uint16_t)((val - ganze) * 10.0f);
+                snprintf(out, 20, "Gyro %s:%c%u.%u", axis, sign, ganze, nachkomma);
+            };
+            char gBuf[20];
+            format_gyro(gBuf, "X", gx); oled.printAt(0, 16, gBuf);
+            format_gyro(gBuf, "Y", gy); oled.printAt(0, 32, gBuf);
+            format_gyro(gBuf, "Z", gz); oled.printAt(0, 48, gBuf);
+            break;
+        }
+
+        case 3: {
+            oled.printAt(0, 0, "4 SYSTEM-LOG");
+            oled.printAt(94, 0, timeBuf);
+            // Punkt 7: nrf_ok statt radio.isChipConnected()
+            oled.printAt(0, 16, nrf_ok       ? "NRF24:    OK" : "NRF24:    FEHLER");
+            oled.printAt(0, 32, bmp_local_ok ? "LocalB:   OK" : "LocalB:   FEHLER");
+            oled.printAt(0, 48, "System:   READY");
+            break;
+        }
     }
-    
-    oled.printAt(70, 0, ".");
-    oled.printAt(74, 0, alt_dec);
-    oled.printAt(80, 0, "m");
-    
-    // Modus-Symbol direkt dahinter platzieren (z.B. R, L, D oder ?)
-    char mode_buf[2] = { height_mode_symbol, '\0' };
-    oled.printAt(88, 0, mode_buf); 
-
-    // 3. Flugzeit ganz rechts (Pixel 98 bis 122)
-    uint32_t minutes = flight_duration_s / 60;
-    uint32_t seconds = flight_duration_s % 60;
-    
-    if (minutes < 10) { 
-        oled.printAt(98, 0, "0"); 
-        oled.printAt(104, 0, (long)minutes); 
-    } else { 
-        oled.printAt(98, 0, (long)minutes); 
-    }
-    
-    oled.printAt(110, 0, ":");
-    
-    if (seconds < 10) { 
-        oled.printAt(116, 0, "0"); 
-        oled.printAt(122, 0, (long)seconds); 
-    } else { 
-        oled.printAt(116, 0, (long)seconds); 
-    }
-
-
-    // =======================================================================
-    // ZEILE 2 & 3: Batterie-Balken (bleiben unverändert)
-    // =======================================================================
-    drawBatteryBar(12, "BAT-C", ctrl_bat_mv, CTRL_BAT_MIN_MV, CTRL_BAT_MAX_MV);
-    drawBatteryBar(22, "BAT-D", drone_bat_mv, DRONE_BAT_MIN_MV, DRONE_BAT_MAX_MV);
-
-
-    // =======================================================================
-    // ZEILE 4: NEU - Kopfzeile / Spaltenbeschriftung für die Sensorachsen
-    // =======================================================================
-    // Wir rücken die Achsenbeschriftung exakt über die Werte der Zeilen 5 und 6
-    oled.printAt(44, 34, "X");
-    oled.printAt(76, 34, "Y");
-    oled.printAt(108, 34, "Z");
-
-
-    // =======================================================================
-    // ZEILE 5: Gyroskop (Drehraten in °/s) mit allen 3 Achsen
-    // =======================================================================
-    oled.printAt(0, 45, "G(dps)");
-    
-    // X-Achse (Format X.X - wir nutzen 1 Nachkommastelle wegen der Breite bei 3 Achsen)
-    long gx_whole = (long)gx;
-    long gx_dec   = (long)abs((gx - gx_whole) * 10);
-    oled.printAt(38, 45, gx_whole);
-    oled.printAt(50, 45, ".");
-    oled.printAt(56, 45, gx_dec);
-
-    // Y-Achse (Format Y.Y)
-    long gy_whole = (long)gy;
-    long gy_dec   = (long)abs((gy - gy_whole) * 10);
-    oled.printAt(70, 45, gy_whole);
-    oled.printAt(82, 45, ".");
-    oled.printAt(88, 45, gy_dec);
-
-    // Z-Achse (Format Z.Y)
-    long gz_whole = (long)gz;
-    long gz_dec   = (long)abs((gz - gz_whole) * 10);
-    oled.printAt(102, 45, gz_whole);
-    oled.printAt(114, 45, ".");
-    oled.printAt(120, 45, gz_dec);
-
-
-    // =======================================================================
-    // ZEILE 6: Beschleunigung (g-Kräfte) mit allen 3 Achsen
-    // =======================================================================
-    oled.printAt(0, 56, "A(g)");
-
-    // X-Achse (Format X.X)
-    long ax_whole = (long)ax;
-    long ax_dec   = (long)abs((ax - ax_whole) * 10);
-    oled.printAt(38, 56, ax_whole);
-    oled.printAt(50, 56, ".");
-    oled.printAt(56, 56, ax_dec);
-
-    // Y-Achse (Format Y.Y)
-    long ay_whole = (long)ay;
-    long ay_dec   = (long)abs((ay - ay_whole) * 10);
-    oled.printAt(70, 56, ay_whole);
-    oled.printAt(82, 56, ".");
-    oled.printAt(88, 56, ay_dec);
-
-    // Z-Achse (Format Z.Y)
-    long az_whole = (long)az;
-    long az_dec   = (long)abs((az - az_whole) * 10);
-    oled.printAt(102, 56, az_whole);
-    oled.printAt(114, 56, ".");
-    oled.printAt(120, 56, az_dec);
-
     oled.sendBuffer();
 }
 
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
-// Globale Variablen (oben in der transmitter.cpp ergänzen, falls noch nicht da)
-bool nrf_ok = false;
-bool bmp_local_ok = false;
-bool oled_ok = false;
-// (Ergänze hier deine bestehenden Variablen für Verbindung/Drohnendaten)
-unsigned long last_drone_packet_time = 0; 
-const unsigned long DRONE_TIMEOUT = 2000; // 2 Sekunden Timeout für Funkverbindung
-
 void setup() {
-    // 1. UART starten und auf PC-Verbindung warten (damit du keine Ausgaben verpasst!)
+    Serial1.setTx(UART_TX_PIN);
+    Serial1.setRx(UART_RX_PIN);
     DEBUG_UART.begin(115200);
-    while (!DEBUG_UART) {
-        delay(10); // Wartet bei STM32/USB-Boards, bis der Serial Monitor geöffnet wird
-    }
-    delay(500); // Kleiner Sicherheits-Puffer
+    delay(500);
 
     DEBUG_UART.println(F("\n-------------------------------------"));
     DEBUG_UART.println(F(" STM32 - Controller Initialisierung"));
     DEBUG_UART.println(F("-------------------------------------"));
 
-    // 2. Hardware-Pins und ADC konfigurieren
-    analogReadResolution(12);
-    pinMode(LEFT_X_PIN,   INPUT_ANALOG);
-    pinMode(LEFT_Y_PIN,   INPUT_ANALOG);
-    pinMode(RIGHT_X_PIN,  INPUT_ANALOG);
-    pinMode(RIGHT_Y_PIN,  INPUT_ANALOG);
-    pinMode(CTRL_BAT_ADC_PIN, INPUT_ANALOG);
-    pinMode(LEFT_SW_PIN,   INPUT_PULLUP);
-    pinMode(RIGHT_SW_PIN, INPUT_PULLUP);
-    // pinMode(BUZZER_PIN, OUTPUT); // Falls vorhanden
+    pinMode(LED_GREEN_PIN,  OUTPUT);
+    pinMode(LED_RED_PIN,    OUTPUT);
+    pinMode(LED_YELLOW_PIN, OUTPUT);
+    pinMode(LED_BLUE_PIN,   OUTPUT);
+    digitalWrite(LED_GREEN_PIN,  LOW);
+    digitalWrite(LED_RED_PIN,    LOW);
+    digitalWrite(LED_YELLOW_PIN, LOW);
+    digitalWrite(LED_BLUE_PIN,   LOW);
 
-    // 3. I2C Bus starten
+    analogReadResolution(12);
+    pinMode(LEFT_X_PIN,       INPUT_ANALOG);
+    pinMode(LEFT_Y_PIN,       INPUT_ANALOG);
+    pinMode(RIGHT_X_PIN,      INPUT_ANALOG);
+    pinMode(RIGHT_Y_PIN,      INPUT_ANALOG);
+    pinMode(CTRL_BAT_ADC_PIN, INPUT_ANALOG);
+    pinMode(LEFT_SW_PIN,      INPUT_PULLUP);
+    pinMode(RIGHT_SW_PIN,     INPUT_PULLUP);
+
+    buzzer.init();
+
     Wire.setSDA(I2C_SDA_PIN);
     Wire.setSCL(I2C_SCL_PIN);
     Wire.begin();
-    Wire.setClock(400000); 
+    Wire.setClock(100000);
 
-    // 4. Display starten & Boot-Animation zeigen
+    DEBUG_UART.println(F("[I2C] Scanne Bus (PB6/PB7)..."));
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            DEBUG_UART.print(F("  Gefunden: 0x"));
+            DEBUG_UART.println(addr, HEX);
+        }
+    }
+
     oled.init(OLED_I2C_ADDR);
-    oled_ok = true; // Wenn init durchläuft, läuft das OLED
-    
+    oled_ok = true;
     playBootAnimation();
-    
-    // Display für das Protokoll vorbereiten
+
     oled.clearBuffer();
     oled.printAt(0, 0, "--- INIT SYSTEM ---");
     oled.sendBuffer();
 
-    // 5. ZUERST: Lokales BMP280 (I2C) prüfen und initialisieren
     bmp_local_ok = localBmp.init();
-    DEBUG_UART.print(F("BMP280 - ")); DEBUG_UART.println(bmp_local_ok ? F("Checked") : F("FAILED"));
+    DEBUG_UART.print(F("BMP280 - "));
+    DEBUG_UART.println(bmp_local_ok ? F("OK") : F("FAILED"));
     oled.printAt(0, 16, bmp_local_ok ? "BMP280: OK" : "BMP280: FAILED");
     oled.sendBuffer();
     delay(200);
 
-    // 6. ALS ALLERLETZTES: NRF24 initialisieren (Überschreibt alle blockierten SPI-Pins zurück auf Funk)
-    nrf_ok = init_funk_tx(); 
-    DEBUG_UART.print(F("NRF24 - ")); DEBUG_UART.println(nrf_ok ? F("Checked") : F("FAILED"));
+    nrf_ok = init_funk_tx();
+    DEBUG_UART.print(F("NRF24  - "));
+    DEBUG_UART.println(nrf_ok ? F("OK") : F("FAILED"));
     oled.printAt(0, 24, nrf_ok ? "NRF24: OK" : "NRF24: FAILED");
     oled.sendBuffer();
     delay(200);
 
-    // 7. Daumen-Sticks & Peripherie prüfen (Dummy-Check, da analoge Pins meist immer "OK" sind)
-    DEBUG_UART.println(F("OLED - Checked"));
-    DEBUG_UART.println(F("Buzzer - Checked"));
-    DEBUG_UART.println(F("Thumbstick L - Checked"));
-    DEBUG_UART.println(F("Thumbstick R - Checked"));
-    oled.printAt(0, 32, "Sticks: Checked");
+    DEBUG_UART.println(F("OLED   - OK"));
+    DEBUG_UART.println(F("Buzzer - OK"));
+    DEBUG_UART.println(F("Sticks - OK"));
+    oled.printAt(0, 32, "Sticks: OK");
     oled.sendBuffer();
     delay(400);
 
-    // 8. Auswertung des Gesamtstatus
     bool alles_ok = nrf_ok && bmp_local_ok && oled_ok;
-
     if (alles_ok) {
         DEBUG_UART.println(F("-------------------------------------"));
         DEBUG_UART.println(F(" Initialisierung erfolgreich"));
         DEBUG_UART.println(F("-------------------------------------"));
-        
         oled.printAt(0, 48, "INIT ERFOLGREICH!");
         oled.sendBuffer();
-        delay(1500); // Kurze Bestätigung anzeigen
+        buzzer.playStartupMelody();
+        delay(500);
     } else {
         DEBUG_UART.println(F("-------------------------------------"));
         DEBUG_UART.println(F(" WARNUNG: Fehler bei Initialisierung!"));
         DEBUG_UART.println(F("-------------------------------------"));
-        
-        // Warnsymbol / Text für 3 Sekunden anzeigen
         oled.clearBuffer();
         oled.printAt(20, 16, "/!\\ ACHTUNG /!\\");
         oled.printAt(10, 32, "Hardware-Fehler!");
-        oled.printAt(0, 48, "Pruefe Sensoren...");
+        oled.printAt(0,  48, "Pruefe Sensoren...");
         oled.sendBuffer();
-        
-        // Optional: Hier den Buzzer für 3 Sekunden piepen lassen
-        delay(3000); 
+        buzzer.playBeep();
+        delay(3000);
     }
 
-    // Display leeren für normalen Flugbetrieb
     oled.clearBuffer();
     oled.sendBuffer();
 }
-
 
 // ---------------------------------------------------------------------------
 // Loop
 // ---------------------------------------------------------------------------
 void loop() {
-    static uint32_t last_send_ms  = 0;
-    static uint32_t last_print_ms = 0;
-    static uint32_t last_oled_ms  = 0;
-    static bool funk_verbunden = false;
+    static uint32_t last_send_ms    = 0;
+    static uint32_t last_print_ms   = 0;
+    static uint32_t last_bat_ms     = 0;
+    static uint32_t last_display_ms = 0;
+    static uint32_t last_red_blink  = 0;
+    static bool     red_state       = false;
+    static uint32_t last_arm_ms     = 0;
+    static bool     left_pressed    = false;
+    static uint32_t last_page_ms    = 0;
+    static bool     right_pressed   = false;
+
     uint32_t now_ms = millis();
 
-    ControllerData tx_packet = {};
-
-    analogRead(LEFT_X_PIN);  delayMicroseconds(5);
-    tx_packet.left_x  = analogRead(LEFT_X_PIN);
-    analogRead(LEFT_Y_PIN);  delayMicroseconds(5);
-    tx_packet.left_y  = analogRead(LEFT_Y_PIN);
-    analogRead(RIGHT_X_PIN); delayMicroseconds(5);
-    tx_packet.right_x = analogRead(RIGHT_X_PIN);
-    analogRead(RIGHT_Y_PIN); delayMicroseconds(5);
-    tx_packet.right_y = analogRead(RIGHT_Y_PIN);
-
-    tx_packet.left_click    = (digitalRead(LEFT_SW_PIN)  == LOW) ? 1 : 0;
-    tx_packet.right_click   = (digitalRead(RIGHT_SW_PIN) == LOW) ? 1 : 0;
-    
-    // Echten Akku-Wert ermitteln
-    readControllerBattery();
-    
-    // Mappe mV auf ein Byte (0-100%) für das Datenpaket zur Drohne
-    if (ctrl_bat_mv > CTRL_BAT_MIN_MV) {
-        tx_packet.battery_level = ((ctrl_bat_mv - CTRL_BAT_MIN_MV) * 100) / (CTRL_BAT_MAX_MV - CTRL_BAT_MIN_MV);
-    } else {
-        tx_packet.battery_level = 0;
+    // --- FLUGZEIT-LOGIK (ein einziges Timer-System) ---
+    if (drohne_scharf && !flight_timer_active) {
+        flight_start_ms      = now_ms;
+        flight_timer_active  = true;
+    } else if (!drohne_scharf && flight_timer_active) {
+        total_flight_time_ms += (now_ms - flight_start_ms);
+        flight_timer_active   = false;
     }
-    if (tx_packet.battery_level > 100) tx_packet.battery_level = 100;
-    
-    tx_packet.checksum      = calcControllerChecksum(tx_packet);
 
-    // ==========================================
-    // NEU: LOKALE BAROMETER-DATEN HIER AUSLESEN
-    // ==========================================
+    // --- STICKS LESEN ---
+    ControllerData tx_packet = {};
+    analogRead(LEFT_X_PIN);  delayMicroseconds(5); uint16_t raw_L_X = analogRead(LEFT_X_PIN);
+    analogRead(LEFT_Y_PIN);  delayMicroseconds(5); uint16_t raw_L_Y = analogRead(LEFT_Y_PIN);
+    analogRead(RIGHT_X_PIN); delayMicroseconds(5); uint16_t raw_R_X = analogRead(RIGHT_X_PIN);
+    analogRead(RIGHT_Y_PIN); delayMicroseconds(5); uint16_t raw_R_Y = analogRead(RIGHT_Y_PIN);
+
+    tx_packet.left_x  = 4095 - raw_R_Y;
+    tx_packet.left_y  = 4095 - raw_R_X;
+    tx_packet.right_x = 4095 - raw_L_Y;
+    tx_packet.right_y = 4095 - raw_L_X;
+    tx_packet.left_click  = (digitalRead(LEFT_SW_PIN)  == LOW) ? 1 : 0;
+    tx_packet.right_click = (digitalRead(RIGHT_SW_PIN) == LOW) ? 1 : 0;
+
+    // --- SCHARFSCHALTEN (linker Klick) ---
+    if (tx_packet.left_click == 1 && !left_pressed) {
+        if (now_ms - last_arm_ms >= 500) {
+            last_arm_ms   = now_ms;
+            drohne_scharf = !drohne_scharf;
+            left_pressed  = true;
+            if (drohne_scharf) { buzzer.playTone(2000, 80); delay(50); buzzer.playTone(2000, 80); }
+            else                  buzzer.playTone(1200, 250);
+        }
+    }
+    if (tx_packet.left_click == 0) left_pressed = false;
+
+    if (!funk_verbunden) drohne_scharf = false;
+
+    // --- SEITENWECHSEL (rechter Klick) ---
+    if (tx_packet.right_click == 1 && !right_pressed) {
+        if (now_ms - last_page_ms >= BUTTON_COOLDOWN_MS) {
+            last_page_ms  = now_ms;
+            current_page  = (current_page + 1) % MAX_PAGES;
+            right_pressed = true;
+            buzzer.playTone(2400, 30);
+        }
+    }
+    if (tx_packet.right_click == 0) right_pressed = false;
+
+    // --- AKKU PROZENT BERECHNEN ---
+    uint8_t raw_bat_pct = 0;
+    if (ctrl_bat_mv > CTRL_BAT_MIN_MV)
+        raw_bat_pct = ((ctrl_bat_mv - CTRL_BAT_MIN_MV) * 100) / (CTRL_BAT_MAX_MV - CTRL_BAT_MIN_MV);
+    if (raw_bat_pct > 100) raw_bat_pct = 100;
+    tx_packet.battery_level = raw_bat_pct;
+    if (drohne_scharf) tx_packet.battery_level |= 0x80;
+    tx_packet.checksum = calcControllerChecksum(tx_packet);
+
+    // --- LOKALES BAROMETER --- (Punkt 4: Variablen vor dem if-Block)
     float local_press = 0.0f, local_temp = 0.0f, local_alt = 0.0f;
     if (bmp_local_ok) {
         localBmp.readData(local_press, local_temp, local_alt);
-        
-        // Nullpunkt (Home-Höhe des Piloten) beim allerersten Start setzen
-        if (!home_set) {
-            home_altitude = local_alt;
-            home_set = true;
-        }
+        if (!home_set) { home_altitude = local_alt; home_set = true; }
     }
 
-    // 2. Senden und Telemetrie verarbeiten
+    // --- FUNK SENDEN (50 Hz) ---
     if (now_ms - last_send_ms >= SEND_INTERVAL_MS) {
-        last_send_ms   = now_ms;
+        last_send_ms = now_ms;
         bool tx_success = radio.write(&tx_packet, sizeof(ControllerData));
-        
-        // Signalstärke-Historie updaten
         updateSignalStrength(tx_success);
 
         if (tx_success) {
             last_valid_packet_ms = now_ms;
-            funk_verbunden = true; // Bleibt jetzt aktiv bis zum Timeout!
-
-            if (!timer_active) {
-                flight_start_ms = now_ms;
-                timer_active = true;
-            }
+            funk_verbunden       = true;
 
             if (radio.isAckPayloadAvailable()) {
                 SensorData rx_telemetry;
                 radio.read(&rx_telemetry, sizeof(SensorData));
-
                 uint8_t cs = 0;
                 const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&rx_telemetry);
                 for (size_t i = 0; i < offsetof(SensorData, checksum); i++) cs ^= ptr[i];
-
                 if (cs == rx_telemetry.checksum) {
-                    ax           = rx_telemetry.accel_x  / 1000.0f;
-                    ay           = rx_telemetry.accel_y  / 1000.0f;
-                    az           = rx_telemetry.accel_z  / 1000.0f;
-                    gx           = rx_telemetry.gyro_x   / 10.0f;
-                    gy           = rx_telemetry.gyro_y   / 10.0f;
-                    gz           = rx_telemetry.gyro_z   / 10.0f;
-                    alt          = rx_telemetry.altitude / 100.0f; // Absolute Höhe der Drohne
-                    
-                    // Nur überschreiben, wenn die Drohne tatsächlich Werte liefert (> 0)
-                    if (rx_telemetry.battery_mv > 0) {
-                        drone_bat_mv = rx_telemetry.battery_mv;
-                    }
+                    ax  = rx_telemetry.accel_x  / 1000.0f;
+                    ay  = rx_telemetry.accel_y  / 1000.0f;
+                    az  = rx_telemetry.accel_z  / 1000.0f;
+                    gx  = rx_telemetry.gyro_x   / 10.0f;
+                    gy  = rx_telemetry.gyro_y   / 10.0f;
+                    gz  = rx_telemetry.gyro_z   / 10.0f;
+                    alt = rx_telemetry.altitude  / 100.0f;
+                    if (rx_telemetry.battery_mv > 0) drone_bat_mv = rx_telemetry.battery_mv;
                 }
             }
         }
     }
 
-    // 3. Überwachung des Verbindungsabbruchs (Timeout-Logik)
-    if (now_ms - last_valid_packet_ms >= 5000) {
-        funk_verbunden = false;
-        timer_active = false; // Stoppt den Timer dauerhaft
-    }
+    // --- VERBINDUNGS-TIMEOUT (Punkt 10: DRONE_TIMEOUT genutzt) ---
+    //if (now_ms - last_valid_packet_ms >= DRONE_TIMEOUT) {
+    //    funk_verbunden = false;
+    //}
 
-    // Flugzeit updaten, falls aktiv
-    if (timer_active) {
-        flight_duration_s = (now_ms - flight_start_ms) / 1000;
-    }
-
-    // ==========================================
-    // NEU: RELATIVE HÖHENBERECHNUNG & FALLBACK
-    // ==========================================
+    // --- RELATIVE HÖHE ---
     if (funk_verbunden && bmp_local_ok) {
-        // Optimalfall: Differenz zwischen Drohne und Controller
-        relative_altitude = alt - local_alt;
-        height_mode_symbol = 'R'; // R = Relativer Echtzeitmodus via Funk
+        relative_altitude   = alt - local_alt;
+        height_mode_symbol  = 'R';
     } else if (bmp_local_ok) {
-        // Fallback: Keine Funkdaten. Zeige stattdessen an, wie weit sich der Controller 
-        // seit dem Einschalten vertikal bewegt hat (Eigenbewegung)
-        relative_altitude = local_alt - home_altitude;
-        height_mode_symbol = 'L'; // L = Lokaler Fallback-Modus
+        relative_altitude   = local_alt - home_altitude;
+        height_mode_symbol  = 'L';
     } else if (funk_verbunden) {
-        // Sonderfall: Funk da, aber lokaler Controller-Sensor ausgefallen. 
-        // Nutze den Absolutwert der Drohne
-        relative_altitude = alt; 
-        height_mode_symbol = 'D'; // D = Reine Drohnen-Direkthöhe (ohne Offset-Korrektur)
+        relative_altitude   = alt;
+        height_mode_symbol  = 'D';
     } else {
-        // Komplettausfall aller Systeme
-        relative_altitude = 0.0f;
-        height_mode_symbol = '?';
+        relative_altitude   = 0.0f;
+        height_mode_symbol  = '?';
     }
 
-    // 4. OLED Display zyklisch updaten
-    if (now_ms - last_oled_ms >= OLED_UPDATE_MS) {
-        last_oled_ms = now_ms;
-        updateOLEDDisplay(); 
-        // Tipp: In deiner updateOLEDDisplay() kannst du jetzt 'relative_altitude' 
-        // und den Buchstaben 'height_mode_symbol' (z.B. als "[R]" oder "[L]") ausgeben.
+    // --- LED DASHBOARD ---
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    if (!funk_verbunden) {
+        if (now_ms - last_red_blink >= 500) { last_red_blink = now_ms; red_state = !red_state; }
+        digitalWrite(LED_RED_PIN,    red_state);
+        digitalWrite(LED_YELLOW_PIN, LOW);
+        digitalWrite(LED_BLUE_PIN,   LOW);
+    } else {
+        digitalWrite(LED_RED_PIN, LOW);
+        digitalWrite(LED_BLUE_PIN,   drohne_scharf ? HIGH : LOW);
+        digitalWrite(LED_YELLOW_PIN, drohne_scharf ? LOW  : HIGH);
     }
 
-    // 5. Re-integrierte verfeinerte Serial Monitor Ausgabe incl. g-Werten
+    // --- AKKU MESSEN (alle 2s, Punkt 6: nur hier, nicht zusätzlich oben) ---
+    if (now_ms - last_bat_ms >= 2000) {
+        last_bat_ms = now_ms;
+        readControllerBattery();
+    }
+
+    // --- DISPLAY UPDATE (100ms) ---
+    if (now_ms - last_display_ms >= OLED_UPDATE_MS) {
+        last_display_ms = now_ms;
+        updateOLEDDisplay(tx_packet);
+    }
+
+    // --- SERIAL AUSGABE (5 Hz) ---
     if (now_ms - last_print_ms >= 200) {
         last_print_ms = now_ms;
 
-        // Lokale Berechnung für die serielle Ausgabe
-        uint32_t ser_minutes = flight_duration_s / 60;
-        uint32_t ser_seconds = flight_duration_s % 60;
+        // Flugzeit aus dem einzigen Timer-System berechnen
+        uint32_t cur_ms  = total_flight_time_ms + (flight_timer_active ? (now_ms - flight_start_ms) : 0);
+        uint32_t ser_min = (cur_ms / 1000) / 60;
+        uint32_t ser_sec = (cur_ms / 1000) % 60;
 
         DEBUG_UART.println(F("================ [LOKALE CONTROLLER-WERTE] ================"));
-        DEBUG_UART.print(F("LINKER  Stick: X=")); DEBUG_UART.print(tx_packet.left_x);
-        DEBUG_UART.print(F(" | Y="));             DEBUG_UART.print(tx_packet.left_y);
-        DEBUG_UART.print(F(" | Ctrl Volt: ")); DEBUG_UART.print(ctrl_bat_mv / 1000.0f, 2); DEBUG_UART.println(F(" V"));
-        DEBUG_UART.print(F("Signal: ")); DEBUG_UART.print(signal_percent); DEBUG_UART.print(F("%"));
-        DEBUG_UART.print(F(" | Flugzeit: ")); DEBUG_UART.print(ser_minutes); DEBUG_UART.print(F(":")); 
-        if(ser_seconds < 10) DEBUG_UART.print(F("0")); 
-        DEBUG_UART.println(ser_seconds);
-        
-        // ZUSATZ-INFO FÜR LOKALEN SENSOR IN DER UART-AUSGABE
+        DEBUG_UART.print(F("L-Stick: X=")); DEBUG_UART.print(tx_packet.left_x);
+        DEBUG_UART.print(F(" Y="));         DEBUG_UART.print(tx_packet.left_y);
+        DEBUG_UART.print(F(" | Akku: "));   DEBUG_UART.print(ctrl_bat_mv / 1000.0f, 2); DEBUG_UART.println(F("V"));
+        DEBUG_UART.print(F("Signal: "));    DEBUG_UART.print(signal_percent);
+        DEBUG_UART.print(F("% | Flugzeit: "));
+        if (ser_min < 10) DEBUG_UART.print(F("0")); DEBUG_UART.print(ser_min);
+        DEBUG_UART.print(F(":"));
+        if (ser_sec < 10) DEBUG_UART.print(F("0")); DEBUG_UART.println(ser_sec);
+
         if (bmp_local_ok) {
-            DEBUG_UART.print(F("Lokales Baro:  ")); DEBUG_UART.print(local_press / 100.0f, 1); DEBUG_UART.print(F(" hPa | Alt: ")); DEBUG_UART.print(local_alt, 1); DEBUG_UART.println(F(" m"));
+            DEBUG_UART.print(F("Lok.Baro: "));
+            DEBUG_UART.print(local_press / 100.0f, 1);
+            DEBUG_UART.print(F(" hPa | Alt: "));
+            DEBUG_UART.print(local_alt, 1);
+            DEBUG_UART.println(F(" m"));
         }
 
         DEBUG_UART.println(F("---------------- [TELEMETRIE VON DROHNE] ----------------"));
         if (funk_verbunden) {
-            DEBUG_UART.print(F("Accel [g]:   X=")); DEBUG_UART.print(ax, 2);
-            DEBUG_UART.print(F(" Y="));            DEBUG_UART.print(ay, 2);
-            DEBUG_UART.print(F(" Z="));            DEBUG_UART.println(az, 2);
-            DEBUG_UART.print(F("Gyro [°/s]:  X=")); DEBUG_UART.print(gx, 1);
-            DEBUG_UART.print(F(" Y="));            DEBUG_UART.print(gy, 1);
-            DEBUG_UART.print(F(" Z="));            DEBUG_UART.println(gz, 1);
-            DEBUG_UART.print(F("Abs. Alt [m]:"));   DEBUG_UART.println(alt, 2);
-            DEBUG_UART.print(F("Drone Akku:  "));   DEBUG_UART.print(drone_bat_mv / 1000.0f, 2); DEBUG_UART.println(F(" V"));
+            DEBUG_UART.print(F("Accel[g]:  X=")); DEBUG_UART.print(ax, 2);
+            DEBUG_UART.print(F(" Y="));           DEBUG_UART.print(ay, 2);
+            DEBUG_UART.print(F(" Z="));           DEBUG_UART.println(az, 2);
+            DEBUG_UART.print(F("Gyro[°/s]: X=")); DEBUG_UART.print(gx, 1);
+            DEBUG_UART.print(F(" Y="));           DEBUG_UART.print(gy, 1);
+            DEBUG_UART.print(F(" Z="));           DEBUG_UART.println(gz, 1);
+            DEBUG_UART.print(F("Alt[m]:    "));   DEBUG_UART.println(alt, 2);
+            DEBUG_UART.print(F("Drone Akku: "));  DEBUG_UART.print(drone_bat_mv / 1000.0f, 2); DEBUG_UART.println(F("V"));
         } else {
-            DEBUG_UART.println(F("[FUNK] Keine aktive Verbindung..."));
+            DEBUG_UART.println(F("[FUNK] Keine Verbindung..."));
         }
-        
-        // AUSGABE DER BERECHNETEN DIFFERENZ-HÖHE
-        DEBUG_UART.print(F("Berechnete relative Hoehe: ")); DEBUG_UART.print(relative_altitude, 2); 
-        DEBUG_UART.print(F(" m [Modus: ")); DEBUG_UART.print(height_mode_symbol); DEBUG_UART.println(F("]"));
+        DEBUG_UART.print(F("Rel.Hoehe: ")); DEBUG_UART.print(relative_altitude, 2);
+        DEBUG_UART.print(F("m ["));        DEBUG_UART.print(height_mode_symbol);
+        DEBUG_UART.print(F("] Status: ")); DEBUG_UART.println(drohne_scharf ? F("SCHARF") : F("ENTSCHAERFT"));
         DEBUG_UART.println(F("=========================================================\n"));
     }
 }
